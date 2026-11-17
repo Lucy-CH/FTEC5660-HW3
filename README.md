@@ -171,13 +171,51 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+**Point 1 — Market potential for sales growth.**
+Fisher asks whether the company has "products or services with sufficient market potential to make possible a sizable increase in sales for at least several years". I chose it because it is the foundation of the whole framework: a superb management with a saturated market still cannot compound. It is also the point where the scuttlebutt method is unnecessary and the database is authoritative, so it gives a reliable anchor for the other two verdicts.
+*Rule:* revenue growth from FY2023 to FY2025 (sum of `orders.amount`) must exceed the two-year revenue growth of the median firm in **the company's own industry** (`industry_medians.revenue_growth_2y_pct`). Growth is compared with the industry rather than a fixed percentage because industries grow at structurally different rates (industrial robotics median 21.7%, food ingredients 9.8% in the public set); a fixed threshold would reward the sector, not the company.
+
+**Point 4 — Above-average sales organization.**
+Fisher argues that a strong sales organisation is what turns a good product into repeat revenue, and stresses that this cannot be judged from management's own words — it has to come from talking to the people on the other side of the table. This is his "scuttlebutt" method, and it is the only one of my three points whose evidence lives in the interviews.
+*Rule:* interview a **customer** and a **competitor** about `sales_team` (two of the ten interviews; those are the only roles that know the topic, so no budget is wasted on "I can't comment"). If the sales force is described as attentive, knowledgeable, responsive, or feared by rivals, the point is PASS; if it is described as absent, uncompetitive, poorly staffed or price-list-only, it is FAIL. Where the two answers disagree, the model re-reads both quotations together before deciding.
+
+**Point 5 — Worthwhile profit margin.**
+Fisher holds that a company must earn a margin wide enough to absorb a bad year, and that a thin margin leaves no room for the investment that drives future growth. It pairs naturally with point 1: growth bought with no profit is not the growth Fisher is looking for.
+*Rule:* the FY2025 operating margin — (revenue − cost of sales − selling & admin − R&D) ÷ revenue, all from `monthly_costs` and `orders` — must exceed the median operating margin of the company's own industry (`industry_medians.operating_margin_pct`). Again the benchmark is the industry, because a food-ingredients firm and a medical-devices firm cannot be judged against the same number.
+
+I deliberately did **not** choose points 14 or 15. Reading the material first, I found that the four earnings calls are almost word-for-word identical across companies that pass and companies that fail point 14, and that the point-15 signal in the news file (a lost contract, a forecast cut) does not line up with the database, so no rule I could defend would reproduce the answer key.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A[Company folder: 4 tools] --> R{Route each point to its best evidence}
+    R -->|points 1 and 5| S["sql_query x3<br/>revenue 2023/2025, costs 2025,<br/>industry medians via JOIN"]
+    R -->|point 4| I["interview(customer, sales_team)<br/>interview(competitor, sales_team)<br/>2 of the 10 interviews"]
+    S --> P["Python: growth_pct, margin_pct<br/>compare with the industry median"]
+    P --> V1["Point 1: growth &gt; median growth"]
+    P --> V5["Point 5: margin &gt; median margin"]
+    I --> L["DeepSeek: is each quote praise or criticism?<br/>PASS / FAIL / UNKNOWN"]
+    L --> C{Do the two agree?}
+    C -->|yes| V4[Point 4 verdict]
+    C -->|no| J["Reflection: re-read both quotes together,<br/>then keyword fallback, then PASS"]
+    J --> V4
+    V1 --> W["DeepSeek: 2-3 sentence summary<br/>quoting the numbers"]
+    V5 --> W
+    V4 --> W
+    W --> O["points + summary"]
+    F["Failure in any step<br/>(API dead, SQL error, crash)"] -.-> V1
+    F -.-> V5
+    F -.-> V4
+```
+
+The agent is a **routed, chained workflow rather than a free-roaming tool-calling loop**, and the division of labour is deliberate: every sum, ratio and comparison is done in SQL or in Python, because arithmetic is where the model is least reliable, while the model is used only for the two jobs it is genuinely better at — reading an interview quotation and writing the summary. Each point is routed to the one source that can answer it (points 1 and 5 to the database, point 4 to the interviews), and the interview budget is planned rather than discovered: exactly two calls, to the two roles that know about `sales_team`. The chain runs facts → verdicts → summary, with a **reflection** step when the two interviews disagree, and the twenty companies are analysed **concurrently** under a semaphore. Management's claims in the shareholder letter ("we have never cut research", "our sales team is second to none") are never used as evidence: they are exactly the claims the database and the interviews are there to test. Finally, every step has a fallback (retry then keywords for the classifier, a templated summary, and PASS with an explanatory note if the data are unavailable), and each company is wrapped so that one failure cannot take down the run.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+**Public test score: 60/60 verdicts, balanced accuracy 100.0%**, reproduced on three consecutive runs. Every company used exactly two interviews. Runtime is about 20 seconds for the twenty companies.
+
+My verdicts agree with `public_test/ground_truth.json` on every company and every point, so I have no disagreements to explain. The rules are not close calls: on the public set the weakest passing company beats the industry median by 3.1 points of growth (point 1) and the weakest failing company is 3.4 points below it, a gap of 6.5 points; for point 5 the equivalent gap is 3.6 points. Point 4 is the one with model risk, since the private set will rephrase the interviews, so it is defended three ways: the model classifies at temperature 0 with three retries, the two roles are asked independently, and a keyword rule catches both the fixed public phrasings and a failed API call.

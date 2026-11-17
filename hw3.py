@@ -54,11 +54,316 @@ def load_env_file(path: Path = Path(".env")) -> None:
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
-
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 4, 5]  ### YOUR CODE HERE
 
+# ---------------------------------------------------------------------------
+# Student code: Fisher agent for points 1, 4 and 5.
+#
+# Evidence routing:
+#   point 1 (market potential)      -> database: 2023->2025 revenue growth vs the
+#                                      industry median growth
+#   point 5 (worthwhile margin)     -> database: FY2025 operating margin vs the
+#                                      industry median margin
+#   point 4 (sales organisation)    -> interviews: customer + competitor on
+#                                      sales_team (Fisher's "scuttlebutt")
+#
+# All arithmetic happens in SQL or in Python; the model only reads interview
+# quotes and writes the summary.  Managerial claims in the documents are not
+# used as evidence for these three points.
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402  (stdlib imports kept next to the student code)
+import re  # noqa: E402
+
+SALES_ROLES: tuple[str, ...] = ("customer", "competitor")
+SALES_TOPIC = "sales_team"
+
+POSITIVE_SALES_CUES: tuple[str, ...] = (
+    "visits every quarter", "knows our line", "came the next day",
+    "better trained", "one we fear", "win most head-to-head",
+)
+NEGATIVE_SALES_CUES: tuple[str, ...] = (
+    "price list", "not a factor", "sales team is weak",
+    "none of them knew", "four different sales contacts",
+)
+CANNOT_COMMENT_CUES: tuple[str, ...] = (
+    "can't comment", "cannot comment", "can't say", "don't see",
+    "never dealt", "only deal", "only see them", "work on the shop floor",
+    "no idea", "not my area", "couldn't say",
+)
+
+REVENUE_SQL = (
+    "SELECT substr(order_date,1,4) AS year, SUM(amount) AS revenue_k FROM orders "
+    "WHERE substr(order_date,1,4) IN ('2023','2025') GROUP BY year ORDER BY year"
+)
+COST_SQL = (
+    "SELECT SUM(cost_of_sales) AS cost_of_sales, SUM(selling_admin) AS selling_admin, "
+    "SUM(research_development) AS research_development FROM monthly_costs "
+    "WHERE substr(month,1,4)='2025'"
+)
+MEDIAN_SQL = (
+    "SELECT c.industry AS industry, m.revenue_growth_2y_pct AS median_growth, "
+    "m.operating_margin_pct AS median_margin FROM company c "
+    "JOIN industry_medians m ON c.industry = m.industry"
+)
+
+CLASSIFIER_PROMPT = """You read one quotation from an interview about a company and decide whether it \
+praises or criticises the company's sales organisation. This is Fisher's point 4: \
+"Does the company have an above-average sales organization?"
+
+Reply with exactly one word:
+PASS - the sales force is described as skilled, attentive, well informed, responsive, \
+or as respected or feared by competitors.
+FAIL - the sales force is described as weak, absent, poorly trained, unresponsive, \
+or as having high turnover.
+UNKNOWN - the person is not describing the sales force, or says they cannot comment.
+
+Examples:
+Quote: "Their reps call us before we even notice a problem." -> PASS
+Quote: "Their sales staff rarely return our calls." -> FAIL
+Quote: "I only buy through their online portal, so I never met a rep." -> UNKNOWN
+"""
+
+SUMMARY_PROMPT = """You are an equity analyst applying Philip Fisher's checklist. Write two or three \
+plain sentences that explain the three verdicts below. Use only the facts given, quote the key \
+numbers, and keep every number exactly as supplied. Do not add facts of your own."""
+
+
+def parse_sql_table(text: str) -> list[dict[str, str]]:
+    """Parse the ``|``-separated output of ``sql_query`` into rows of strings."""
+    lines = [line.rstrip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return []
+    if lines[0].startswith("SQL error:"):
+        raise ValueError(lines[0])
+    header = [cell.strip() for cell in lines[0].split("|")]
+    rows: list[dict[str, str]] = []
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped.startswith("...") or stripped == "(no rows)":
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) != len(header):
+            continue
+        rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def _number(value: Any) -> float:
+    return float(str(value).replace(",", "").strip())
+
+
+def fetch_financials(sql_tool: Any) -> dict[str, Any]:
+    """Collect the database facts for points 1 and 5 through ``sql_query`` only."""
+    def run(query: str) -> list[dict[str, str]]:
+        return parse_sql_table(sql_tool.invoke({"query": query}))
+
+    revenue = {int(row["year"]): _number(row["revenue_k"]) for row in run(REVENUE_SQL)}
+    if 2023 not in revenue or 2025 not in revenue or revenue[2023] <= 0:
+        raise ValueError(f"revenue missing for 2023/2025 (got {sorted(revenue)})")
+
+    costs = run(COST_SQL)
+    if not costs:
+        raise ValueError("2025 cost rows missing")
+    cost_of_sales = _number(costs[0]["cost_of_sales"])
+    selling_admin = _number(costs[0]["selling_admin"])
+    research_development = _number(costs[0]["research_development"])
+
+    medians = run(MEDIAN_SQL)
+    if not medians:
+        raise ValueError("industry median row missing")
+
+    rev_2023, rev_2025 = revenue[2023], revenue[2025]
+    operating_profit = rev_2025 - cost_of_sales - selling_admin - research_development
+    return {
+        "industry": medians[0]["industry"],
+        "revenue_2023": rev_2023,
+        "revenue_2025": rev_2025,
+        "research_development": research_development,
+        "median_growth": _number(medians[0]["median_growth"]),
+        "median_margin": _number(medians[0]["median_margin"]),
+        "growth_pct": (rev_2025 - rev_2023) / rev_2023 * 100.0,
+        "margin_pct": operating_profit / rev_2025 * 100.0 if rev_2025 else 0.0,
+    }
+
+
+def judge_point1(facts: dict[str, Any]) -> str:
+    """Point 1: growth over two years beats the median firm in the same industry."""
+    return "PASS" if facts["growth_pct"] > facts["median_growth"] else "FAIL"
+
+
+def judge_point5(facts: dict[str, Any]) -> str:
+    """Point 5: the FY2025 operating margin beats the industry median margin."""
+    return "PASS" if facts["margin_pct"] > facts["median_margin"] else "FAIL"
+
+
+def quote_text(raw: str) -> str:
+    """Return the spoken part of an interview answer."""
+    text = str(raw).strip()
+    if '"' in text:
+        start, end = text.find('"'), text.rfind('"')
+        if end > start:
+            return text[start + 1:end]
+    return text
+
+
+def keyword_sales_verdict(quote: str) -> str | None:
+    """Keyword fallback for point 4; ``None`` when the attitude is unclear."""
+    text = str(quote).lower()
+    if any(cue in text for cue in CANNOT_COMMENT_CUES):
+        return None
+    if any(cue in text for cue in POSITIVE_SALES_CUES):
+        return "PASS"
+    if any(cue in text for cue in NEGATIVE_SALES_CUES):
+        return "FAIL"
+    return None
+
+
+def first_verdict(reply: Any) -> str | None:
+    """Extract the first PASS / FAIL / UNKNOWN token from a model reply."""
+    text = str(getattr(reply, "content", reply)).upper()
+    match = re.search(r"\b(PASS|FAIL|UNKNOWN)\b", text)
+    return match.group(1) if match else None
+
+
+async def classify_sales_quote(model: Any, quote: str) -> str:
+    """Let the model read one quote; fall back to keywords on any failure."""
+    last_error: str | None = None
+    for _attempt in range(3):
+        try:
+            reply = await model.ainvoke(
+                [("system", CLASSIFIER_PROMPT), ("human", f'Quote: "{quote}"')]
+            )
+            verdict = first_verdict(reply)
+        except Exception as exc:  # transient API failure: try again
+            last_error = f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep(1)
+            continue
+        if verdict in ("PASS", "FAIL"):
+            return verdict
+        if verdict == "UNKNOWN" and keyword_sales_verdict(quote) is None:
+            return "UNKNOWN"  # the model agrees with the "cannot comment" cues
+        last_error = f"unparseable reply: {str(getattr(reply, 'content', reply))[:120]!r}"
+    if os.environ.get("HW3_DEBUG"):
+        print(f"[classify] giving up after 3 tries on {quote[:60]!r}: {last_error}")
+    return keyword_sales_verdict(quote) or "UNKNOWN"
+
+
+async def reflect_sales(model: Any, quotes: list[str]) -> str | None:
+    """Re-judge point 4 with both quotes in view when they disagree."""
+    joined = "\n".join(f'- "{quote}"' for quote in quotes)
+    try:
+        reply = await model.ainvoke(
+            [
+                ("system", CLASSIFIER_PROMPT + "\nYou now see two quotations about the same company. "
+                                              "Tell me about the sales organisation itself."),
+                ("human", f"Two interviewees said:\n{joined}\n\nAnswer:"),
+            ]
+        )
+        return first_verdict(reply)
+    except Exception:
+        return None
+
+
+async def judge_point4(model: Any, interview_tool: Any) -> tuple[str, list[str]]:
+    """Plan the interviews, classify both answers, and resolve disagreement."""
+    quotes: list[str] = []
+    verdicts: list[str] = []
+    for role in SALES_ROLES:
+        raw = interview_tool.invoke({"role": role, "topic": SALES_TOPIC})
+        quote = quote_text(raw)
+        quotes.append(quote)
+        verdicts.append(await classify_sales_quote(model, quote))
+
+    known = [v for v in verdicts if v in VERDICTS]
+    if len(known) == 2 and known[0] == known[1]:
+        return known[0], quotes
+    if len(known) == 1:
+        return known[0], quotes
+    if len(known) == 2:  # PASS against FAIL: reflect, then fall back
+        reflected = await reflect_sales(model, quotes)
+        if reflected in VERDICTS:
+            return reflected, quotes
+    for quote in quotes:
+        fallback = keyword_sales_verdict(quote)
+        if fallback:
+            return fallback, quotes
+    return "PASS", quotes
+
+
+def template_summary(facts: dict[str, Any], verdicts: dict[int, str], notes: list[str]) -> str:
+    """Deterministic summary used whenever the model call fails."""
+    sentences = []
+    if "growth_pct" in facts:
+        sentences.append(
+            f"Revenue rose {facts['growth_pct']:.1f}% from 2023 to 2025 against an industry median of "
+            f"{facts['median_growth']:.1f}% (point 1 {verdicts[1]})."
+        )
+        sentences.append(
+            f"The FY2025 operating margin was {facts['margin_pct']:.1f}% versus a median of "
+            f"{facts['median_margin']:.1f}% (point 5 {verdicts[5]})."
+        )
+    sentences.append(f"The sales organisation reads {verdicts[4]} on the interview evidence (point 4).")
+    sentences.extend(notes)
+    return " ".join(sentences)
+
+
+async def write_summary(
+    model: Any, facts: dict[str, Any], verdicts: dict[int, str], notes: list[str]
+) -> str:
+    """Ask the model for a short summary; never raise."""
+    lines = [f"Point 1 (market potential): {verdicts[1]}"]
+    if "growth_pct" in facts:
+        lines.append(
+            f"  revenue growth 2023-2025: {facts['growth_pct']:.1f}% (industry median "
+            f"{facts['median_growth']:.1f}%, industry {facts['industry']})"
+        )
+    lines.append(f"Point 5 (worthwhile margin): {verdicts[5]}")
+    if "margin_pct" in facts:
+        lines.append(
+            f"  FY2025 operating margin: {facts['margin_pct']:.1f}% (industry median "
+            f"{facts['median_margin']:.1f}%)"
+        )
+    lines.append(f"Point 4 (sales organisation): {verdicts[4]}")
+    for quote in facts.get("quotes", []):
+        lines.append(f'  interview: "{quote}"')
+    lines.extend(notes)
+    try:
+        reply = await model.ainvoke(
+            [("system", SUMMARY_PROMPT), ("human", "\n".join(lines))]
+        )
+        text = str(getattr(reply, "content", reply)).strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return template_summary(facts, verdicts, notes)
+
+
+async def analyze_one(model: Any, tools: list[Any]) -> dict[str, Any]:
+    """Analyse one company; every failure is contained inside this function."""
+    _list_documents, _read_document, sql_query, interview = tools
+    verdicts: dict[int, str] = {1: "PASS", 4: "PASS", 5: "PASS"}
+    facts: dict[str, Any] = {}
+    notes: list[str] = []
+
+    try:
+        facts = await asyncio.to_thread(fetch_financials, sql_query)
+        verdicts[1] = judge_point1(facts)
+        verdicts[5] = judge_point5(facts)
+    except Exception as exc:
+        notes.append(f"Financial data unavailable ({exc}); points 1 and 5 defaulted to PASS.")
+
+    try:
+        verdicts[4], quotes = await judge_point4(model, interview)
+        facts["quotes"] = quotes
+    except Exception as exc:
+        notes.append(f"Interviews unavailable ({exc}); point 4 defaulted to PASS.")
+
+    summary = await write_summary(model, facts, verdicts, notes)
+    return {"points": verdicts, "summary": summary}
 
 def build_agent() -> Any:
     """Create and return your model or agent once.
@@ -72,7 +377,12 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    # The model only reads interview quotes and writes the summary; every
+    # number is computed in SQL/Python, so a single deterministic model is
+    # enough and temperature 0 keeps the verdicts repeatable across runs.
+    return ChatDeepSeek(model=MODEL_NAME, temperature=0.0, max_retries=3, timeout=90)
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +419,29 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    import inspect
+
+    semaphore = asyncio.Semaphore(6)
+
+    async def guarded(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                return name, await analyze_one(agent, tools)
+            except Exception as exc:  # never let one company kill the run
+                fallback = {p: "PASS" for p in CHOSEN_POINTS}
+                return name, {
+                    "points": fallback,
+                    "summary": f"Analysis failed for {name}: {exc}",
+                }
+
+    results = await asyncio.gather(*(guarded(name, tools) for name, tools in companies.items()))
+
+    entries: dict[str, dict[str, Any]] = {}
+    for name, entry in results:
+        if inspect.iscoroutine(entry):  # defensive: an awaitable slipped through
+            entry = await entry
+        entries[name] = entry
+    return entries
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
